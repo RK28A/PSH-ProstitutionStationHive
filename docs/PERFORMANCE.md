@@ -19,6 +19,7 @@ son pilote. Les gains ci-dessous sont réels là où ils sont mesurés ; leur ef
 | --- | --- | --- |
 | Les threads en attente d'un mutex du jeu guettent leur tour 50 µs avant de s'endormir, sans changer l'ordre FIFO d'origine | 2 threads sur un mutex : 80 000 → 0,6 à 2,9 millions de verrouillages/s ; 4 threads : 76 000 → 0,55 à 0,75 million | `src/kernel/pthread.cpp` |
 | Le moteur de rendu n'interroge plus le pilote Vulkan à chaque draw quand aucune opération différée ne peut être prête | `PopPendingOperations` : 2,8 % → 0,9 % du temps d'un draw sur lavapipe ; l'appel supprimé est un appel système sur les pilotes Mesa | `src/graphics/host_gpu/renderer/commandScheduler.cpp`, `pipeline/descriptorHeap.cpp` |
+| Chaque thread garde ses dernières recherches de métadonnées de shader au lieu de prendre un verrou global à chaque étage de chaque draw | `ShaderGetMappedData` : 3,3 % → 0,7 % du temps d'un draw sur lavapipe | `src/graphics/shader/shader.cpp` |
 | Timers précis sous Linux (`PR_SET_TIMERSLACK`) | un sommeil de 100 µs durait 160 µs, il en dure 114 ; 50 µs : 110 → 63 | `src/common/threads.cpp` |
 | Reconfigurer CMake dans un dossier de build existant n'échoue plus (le patch ZArchive n'est appliqué qu'une fois) | deux `cmake` de suite réussissent | `3rdparty/CMakeLists.txt`, `3rdparty/patches/apply_once.cmake` |
 
