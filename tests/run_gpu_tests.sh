@@ -12,7 +12,7 @@
 # renderer shows up as a difference from that list. --update rewrites the list.
 set -u
 
-build="${1:?usage: run_gpu_tests.sh <build dir> [--update]}"
+build="$(cd "${1:?usage: run_gpu_tests.sh <build dir> [--update]}" && pwd)" || exit 2
 update="${2:-}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tests="$build/shader_recompiler_compute_tests"
