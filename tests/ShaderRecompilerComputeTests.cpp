@@ -22397,7 +22397,8 @@ public:
 
   // Times the write faults of GPU memory tracking: shader_recompiler_compute_tests --fault-bench
   // Each round caches a range in the buffer cache, which write-protects its pages, then writes
-  // one byte to every page; each write faults once and returns the page to the guest.
+  // one byte to every page in order; a write to a protected page faults and returns it to the
+  // guest.
   void BenchFaults(uint32_t pages) {
     const char *name = "FaultBench";
     constexpr uintptr_t base_address = 0x0000000204400000ull;
@@ -22442,11 +22443,11 @@ public:
           std::chrono::steady_clock::now() - begin).count();
       faults = g_handled_gpu_faults.load() - before;
       Require(name, "faults", faults != 0, "writes to a cached range did not fault");
-      const auto per_fault = elapsed / static_cast<double>(faults);
-      best = round == 0 ? per_fault : std::min(best, per_fault);
+      best = round == 0 ? elapsed : std::min(best, elapsed);
     }
-    std::printf("[bench]   %u written pages took %llu faults, %.0f ns each (best of %u rounds)\n",
-                pages, static_cast<unsigned long long>(faults), best, rounds);
+    std::printf("[bench]   %u pages written in order: %llu faults, %.0f ns per page, %.3f ms in "
+                "all (best of %u rounds)\n",
+                pages, static_cast<unsigned long long>(faults), best / pages, best / 1e6, rounds);
     scheduler.Finish();
     Require(name, "release memory",
             Libs::LibKernel::Memory::KernelMunmap(base_address, allocation_size) == 0 &&
