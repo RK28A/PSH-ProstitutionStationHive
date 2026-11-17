@@ -1,8 +1,9 @@
 # Ce fork : performances, mesures et état des lieux
 
 Ce dépôt est un fork de [KytyPS5](https://github.com/KytyPS5/KytyPS5) pris au commit amont
-`d45b0865`, avec tout son historique. Ce document dit ce qui a été changé, ce que chaque
-changement rapporte **mesures à l'appui**, et ce qui ne l'a pas été.
+`d45b0865`. L'historique de l'émulateur lui-même reste dans le dépôt amont. Ce document dit ce
+qui a été changé, ce que chaque changement rapporte **mesures à l'appui**, et ce qui ne l'a pas
+été.
 
 ## Ce qu'il faut savoir avant tout
 
