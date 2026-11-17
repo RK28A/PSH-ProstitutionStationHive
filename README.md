@@ -4,7 +4,9 @@
 > This repository is a performance-focused fork of
 > [KytyPS5](https://github.com/KytyPS5/KytyPS5), imported with its full history at upstream commit
 > `d45b0865`. It stays under the same GPL-2.0 license; all credit for the emulator goes to the
-> KytyPS5 and Kyty authors. The upstream README follows unchanged.
+> KytyPS5 and Kyty authors. What this fork changes, with the measurements behind each change, is
+> in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) (in French). The upstream README follows
+> unchanged.
 
 # KytyPS5
 
