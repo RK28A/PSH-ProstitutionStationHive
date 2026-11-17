@@ -22163,15 +22163,23 @@ public:
   }
 
   // Times steady-state draws through the render executor and prints the CPU time per draw:
-  //   shader_recompiler_compute_tests --draw-bench [draws]
+  //   shader_recompiler_compute_tests --draw-bench [draws [case]]
   // Every scenario draws one triangle into a 32x32 target, so the time is the renderer's own
   // per-draw work and not the rasterizer's.
-  void BenchDraws(uint32_t draws) {
+  void BenchDraws(uint32_t draws, const char *only = nullptr) {
     const char *name = "DrawBench";
     constexpr uint32_t extent = 32;
     constexpr uintptr_t base_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
     EnsureRuntimeContext();
+    // The emulator pushes the descriptors of a pipeline that has few enough, which the other
+    // cases of this file leave off to cover descriptor sets.
+    vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptors{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &push_descriptors;
+    m_physical_device.getProperties2(&properties);
+    const auto previous_push_descriptors = m_runtime_context.max_push_descriptors;
+    m_runtime_context.max_push_descriptors = push_descriptors.maxPushDescriptors;
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -22231,6 +22239,34 @@ public:
       }
       return result;
     }();
+    // Samples the texture whose T# is in s0..s7 with the S# in s8..s11.
+    static const auto textured_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 20, 0x3f000000u);
+      AppendVMovLiteral(&code, 21, 0x3f000000u);
+      code.push_back(EncodeMimg0(0x27, 1));
+      code.push_back(EncodeMimg1(0, 20, 0, 2));
+      AppendVMovLiteral(&code, 2, 0x3f800000u);
+      code.push_back(EncodeExp0(0x00, 0xf));
+      code.push_back(EncodeExp1(0, 0, 0, 2));
+      AppendEnd(&code);
+      return code;
+    }();
+    const auto textured_address = reinterpret_cast<uint64_t>(textured_code.data());
+    ShaderMapUserData(textured_address,
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<uint32_t>(textured_code.size() * sizeof(u32))});
+    const auto texture = [&](uint32_t index) {
+      const uint64_t address = base_address + 0x30000 + index * 0x8000ull;
+      return ShaderTextureResource{{
+          static_cast<uint32_t>(address >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+              (((extent - 1u) & 3u) << 30u),
+          ((extent - 1u) >> 2u) | ((extent - 1u) << 14u),
+          DstSel(4, 4, 4, 4) |
+              (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0, 0, 0}};
+    };
     static ShaderUserData vertex_user_data{};
     const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
     ShaderMapUserData(vertex_address,
@@ -22269,10 +22305,22 @@ public:
     user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
 
     const DrawAutoArgs args{.vertex_count = 3, .instance_count = 1};
-    enum class Churn { None, PixelShader, BlendConstant, Viewport, RenderTarget };
+    enum class Churn {
+      None, PixelShader, BlendConstant, Viewport, RenderTarget, Textured, Texture
+    };
     const auto prepare = [&](Churn churn, uint32_t draw) {
       switch (churn) {
         case Churn::None: break;
+        case Churn::Textured:
+        case Churn::Texture: {
+          const auto descriptor = texture(churn == Churn::Texture ? draw & 1u : 0u);
+          shaders.SetPsShaderBase(textured_address);
+          shaders.SetPsShaderResource2({.user_sgpr = 12});
+          for (uint32_t i = 0; i < 12; i++) {
+            shaders.SetPsUserSgpr(i, i < 8 ? descriptor.fields[i] : 0u);
+          }
+          break;
+        }
         case Churn::PixelShader: shaders.SetPsShaderBase(pixel_addresses[draw & 1u]); break;
         case Churn::BlendConstant:
           registers.SetBlendColor({.red = static_cast<float>(draw & 1u), .alpha = 1.0f});
@@ -22287,6 +22335,9 @@ public:
       }
     };
     const auto run = [&](const char *label, Churn churn) {
+      if (only != nullptr && std::strcmp(only, label) != 0) {
+        return;
+      }
       // Warm the program, pipeline and image caches for both states.
       for (uint32_t draw = 0; draw < 4; draw++) {
         prepare(churn, draw);
@@ -22330,9 +22381,13 @@ public:
     run("alternating blend color", Churn::BlendConstant);
     run("alternating viewport", Churn::Viewport);
     run("alternating target", Churn::RenderTarget);
+    registers.SetColorBase(0, {.addr = base_address + 0x10000});
+    run("textured", Churn::Textured);
+    run("alternating texture", Churn::Texture);
 
     context.UnmapMemory(base_address, allocation_size);
     scheduler.Finish();
+    m_runtime_context.max_push_descriptors = previous_push_descriptors;
     Require(name, "release memory",
             Libs::LibKernel::Memory::KernelMunmap(base_address, allocation_size) == 0 &&
                 Libs::LibKernel::Memory::KernelReleaseDirectMemory(
@@ -56558,7 +56613,8 @@ int main(int argc, char **argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--draw-bench") == 0) {
     VulkanHarness vulkan;
     vulkan.BenchDraws(argc >= 3 ? static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10))
-                                : 20000u);
+                                : 20000u,
+                      argc >= 4 ? argv[3] : nullptr);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
