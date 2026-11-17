@@ -1,0 +1,40 @@
+# Selectors of shader_recompiler_compute_tests that fail on lavapipe.
+# Written by tests/run_gpu_tests.sh --update with:
+# driverInfo         = Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)
+--buffer-cache-range-only
+--buffer-format-store-only
+--buffer-publication-only
+--centroid-only
+--cmp-eq-f64-only
+--cmp-i64-only
+--cmpx-lt-i16-only
+--compute-meta-clear-only
+--dpp-only
+--ds-atomics-only
+--ds-ordered-count-only
+--flat-d16-only
+--gpu-tiler-only
+--htile-clear-only
+--image-overlap-only
+--image-rebind-only
+--image-sample-offset-only
+--indirect-buffer-only
+--indirect-image-only
+--integer64-compare-only
+--mad-f32-only
+--native64-only
+--new-opcodes-only
+--ordered-dispatch-only
+--packed-texture-only
+--pixel-alias-only
+--polygon-mode-only
+--ray-tracing-only
+--readlane-key-guard-only
+--robust-buffer-only
+--s-ashr-i64-only
+--sampled-depth-resource-only
+--scalar-sext-only
+--scaled-texture-only
+--sdwa-addc-only
+--thread-dimensions-only
+--wave64-only

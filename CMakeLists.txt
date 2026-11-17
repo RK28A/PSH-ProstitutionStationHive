@@ -675,6 +675,20 @@ add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
+# Lets the GPU regression tests run on a software rasterizer; see tests/run_gpu_tests.sh.
+if(LINUX)
+	set(software_gpu_layer_dir "${PROJECT_BINARY_DIR}/software_gpu_layer")
+	add_library(kyty_software_gpu_layer MODULE EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/software_gpu_layer/softwareGpuLayer.cpp")
+	target_link_libraries(kyty_software_gpu_layer PRIVATE Vulkan::Headers)
+	set_target_properties(kyty_software_gpu_layer PROPERTIES
+		OUTPUT_NAME VkLayer_kyty_software_gpu_caps
+		LIBRARY_OUTPUT_DIRECTORY "${software_gpu_layer_dir}"
+		CXX_VISIBILITY_PRESET hidden)
+	configure_file("${KYTY_TESTS_DIR}/software_gpu_layer/VkLayer_kyty_software_gpu_caps.json"
+		"${software_gpu_layer_dir}/VkLayer_kyty_software_gpu_caps.json" COPYONLY)
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
