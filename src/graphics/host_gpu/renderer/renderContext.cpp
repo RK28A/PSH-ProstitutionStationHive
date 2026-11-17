@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -70,13 +72,49 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return true;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		const auto run = SequentialWriteRun(fault_vaddr);
+		const auto vaddr =
+		    run != 0 ? Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE) : fault_vaddr;
+		const auto size = run != 0 ? run : fault_size;
+		m_buffer_cache.InvalidateMemory(vaddr, size);
+		m_texture_cache.InvalidateMemory(vaddr, size);
+		m_image_heap.InvalidateMemory(vaddr, size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+uint64_t RenderContext::SequentialWriteRun(uint64_t fault_vaddr) noexcept {
+	// A thread that fills tracked memory faults once for each page, and a fault costs
+	// microseconds. When a thread's faults follow one another page after page, the pages after
+	// the fault are released with it, twice as many each time, so a long write takes a few faults
+	// instead of one for each page. A released page the thread then does not write is uploaded
+	// again unchanged; the doubling keeps those below the pages it did write.
+	constexpr uint64_t max_pages = 64;
+	struct Sequence {
+		uint64_t next_page = 0;
+		uint64_t pages     = 1;
+	};
+	static thread_local Sequence sequence;
+
+	const auto page  = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+	auto       pages = page == sequence.next_page ? std::min(sequence.pages * 2, max_pages) : 1;
+	// The run ends where releasing a page is more than a guess at the next write: outside the
+	// mapping, at memory the GPU wrote, which would be read back, at a cached image, which would
+	// be uploaded whole, and at an image write-back that is still due.
+	while (pages > 1) {
+		const auto rest = (pages - 1) * TRACKER_PAGE_SIZE;
+		if (IsMapped(page, pages * TRACKER_PAGE_SIZE) &&
+		    !m_buffer_cache.IsRegionGpuModified(page + TRACKER_PAGE_SIZE, rest) &&
+		    !m_texture_cache.IsRegionRegistered(page + TRACKER_PAGE_SIZE, rest) &&
+		    m_texture_cache.WriteBackTick(page + TRACKER_PAGE_SIZE, rest) == 0) {
+			break;
+		}
+		pages /= 2;
+	}
+	sequence = {page + pages * TRACKER_PAGE_SIZE, pages};
+	return pages > 1 ? pages * TRACKER_PAGE_SIZE : 0;
 }
 
 bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {

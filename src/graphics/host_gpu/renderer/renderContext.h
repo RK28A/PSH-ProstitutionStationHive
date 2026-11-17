@@ -75,6 +75,9 @@ private:
 
 	// Waits for the image write-backs over the range's pages; returns whether any overlapped.
 	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
+	// The bytes to release from the faulting page on, when the calling thread is writing page
+	// after page, or 0 to release the faulting byte alone.
+	uint64_t SequentialWriteRun(uint64_t fault_vaddr) noexcept;
 
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
