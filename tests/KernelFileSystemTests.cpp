@@ -278,6 +278,88 @@ void TestPendingSignalDispatch() {
   Check(remove(30) == OK, "remove signal handler");
 }
 
+// Measures guest mutex throughput: kernel_file_system_tests --mutex-bench [milliseconds]
+// Each thread locks one shared mutex, increments a counter and unlocks. "busy" threads do
+// nothing else; "paced" threads work for about a microsecond between two acquisitions.
+struct MutexBenchThread {
+  Libs::LibKernel::PthreadMutex *mutex = nullptr;
+  uint64_t *shared = nullptr;
+  std::atomic<bool> *start = nullptr;
+  std::atomic<bool> *stop = nullptr;
+  bool paced = false;
+  uint64_t acquisitions = 0;
+  Libs::LibKernel::Pthread thread = nullptr;
+  std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
+};
+
+void *KYTY_SYSV_ABI RunMutexBenchThread(void *arg) {
+  using namespace Libs::LibKernel;
+  auto &self = *static_cast<MutexBenchThread *>(arg);
+  while (!self.start->load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  volatile uint32_t work = 0;
+  while (!self.stop->load(std::memory_order_relaxed)) {
+    PthreadMutexLock(self.mutex);
+    ++*self.shared;
+    PthreadMutexUnlock(self.mutex);
+    self.acquisitions++;
+    if (self.paced) {
+      for (uint32_t i = 0; i < 400; i++) {
+        work = work + i;
+      }
+    }
+  }
+  return nullptr;
+}
+
+void BenchMutex(uint32_t milliseconds) {
+  using namespace Libs::LibKernel;
+  for (const bool paced : {false, true}) {
+    for (const uint32_t count : {1u, 2u, 4u, 8u}) {
+      PthreadMutex mutex = nullptr;
+      Check(PthreadMutexInit(&mutex, nullptr, "MutexBench") == OK, "create benchmark mutex");
+      uint64_t shared = 0;
+      std::atomic<bool> start{false}, stop{false};
+      std::vector<std::unique_ptr<MutexBenchThread>> threads;
+      for (uint32_t i = 0; i < count; i++) {
+        auto &thread = *threads.emplace_back(std::make_unique<MutexBenchThread>());
+        thread.mutex = &mutex;
+        thread.shared = &shared;
+        thread.start = &start;
+        thread.stop = &stop;
+        thread.paced = paced;
+        PthreadAttr attr = nullptr;
+        Check(PthreadAttrInit(&attr) == OK &&
+                  PthreadAttrSetstack(&attr, thread.stack.data(), thread.stack.size()) == OK &&
+                  PthreadCreate(&thread.thread, &attr, RunMutexBenchThread, &thread,
+                                "MutexBench") == OK &&
+                  PthreadAttrDestroy(&attr) == OK,
+              "create benchmark thread");
+      }
+      const auto begin = std::chrono::steady_clock::now();
+      start = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+      stop = true;
+      uint64_t total = 0, least = UINT64_MAX, most = 0;
+      for (auto &thread : threads) {
+        Check(PthreadJoin(thread->thread, nullptr) == OK, "join benchmark thread");
+        total += thread->acquisitions;
+        least = std::min(least, thread->acquisitions);
+        most = std::max(most, thread->acquisitions);
+      }
+      const auto seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+      Check(shared == total && PthreadMutexDestroy(&mutex) == OK,
+            "benchmark mutex excluded its threads");
+      std::printf("[bench]   mutex %-5s threads=%u %12.0f locks/s  (per thread: least %.0f, most "
+                  "%.0f)\n",
+                  paced ? "paced" : "busy", count, static_cast<double>(total) / seconds,
+                  static_cast<double>(least) / seconds, static_cast<double>(most) / seconds);
+    }
+  }
+}
+
 class TempDirectory {
 public:
   TempDirectory() {
@@ -2829,6 +2911,11 @@ int main(int argc, char** argv) {
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   TestPendingSignalDispatch();
+  if (argc >= 2 && std::string_view(argv[1]) == "--mutex-bench") {
+    BenchMutex(argc >= 3 ? static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10)) : 500u);
+    subsystems.Destroy();
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
