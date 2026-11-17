@@ -7,6 +7,10 @@
 #include <memory>
 #include <thread>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -57,6 +61,11 @@ static std::thread::id g_main_thread;
 
 void InitializeThreads() {
 	g_main_thread = std::this_thread::get_id();
+#if defined(__linux__)
+	// Linux lets a timer fire up to 50 us late by default, which stretches every short sleep and
+	// timed wait: a 100 us sleep takes about 160 us. Threads inherit the slack of their creator.
+	prctl(PR_SET_TIMERSLACK, 1UL);
+#endif
 }
 
 void Thread::SleepMicro(uint32_t micros) {
