@@ -22395,6 +22395,67 @@ public:
             "mapping or allocation release failed");
   }
 
+  // Times the write faults of GPU memory tracking: shader_recompiler_compute_tests --fault-bench
+  // Each round caches a range in the buffer cache, which write-protects its pages, then writes
+  // one byte to every page; each write faults once and returns the page to the guest.
+  void BenchFaults(uint32_t pages) {
+    const char *name = "FaultBench";
+    constexpr uintptr_t base_address = 0x0000000204400000ull;
+    constexpr uint64_t page_size = 0x1000;
+    const uint64_t size = uint64_t{pages} * page_size;
+    const uint64_t allocation_size = (size + 0xffffu) & ~uint64_t{0xffff};
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    // Routes the mappings and the faults of guest memory to this context.
+    LibKernel::Memory::InstallGpuResources(&context);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base_address);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base_address),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    auto *bytes = reinterpret_cast<volatile uint8_t *>(base_address);
+    constexpr uint32_t rounds = 8;
+    double best = 0;
+    uint64_t faults = 0;
+    for (uint32_t round = 0; round < rounds; round++) {
+      (void)context.GetBufferCache().ObtainBuffer(base_address, size, false);
+      scheduler.Finish();
+      const auto before = g_handled_gpu_faults.load();
+      const auto begin = std::chrono::steady_clock::now();
+      for (uint32_t page = 0; page < pages; page++) {
+        bytes[page * page_size] = static_cast<uint8_t>(round + 1);
+      }
+      const auto elapsed = std::chrono::duration<double, std::nano>(
+          std::chrono::steady_clock::now() - begin).count();
+      faults = g_handled_gpu_faults.load() - before;
+      Require(name, "faults", faults != 0, "writes to a cached range did not fault");
+      const auto per_fault = elapsed / static_cast<double>(faults);
+      best = round == 0 ? per_fault : std::min(best, per_fault);
+    }
+    std::printf("[bench]   %u written pages took %llu faults, %.0f ns each (best of %u rounds)\n",
+                pages, static_cast<unsigned long long>(faults), best, rounds);
+    scheduler.Finish();
+    Require(name, "release memory",
+            Libs::LibKernel::Memory::KernelMunmap(base_address, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "mapping or allocation release failed");
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const bool object_id = !test.object_ids.empty();
@@ -56615,6 +56676,12 @@ int main(int argc, char **argv) {
     vulkan.BenchDraws(argc >= 3 ? static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10))
                                 : 20000u,
                       argc >= 4 ? argv[3] : nullptr);
+    return 0;
+  }
+  if (argc >= 2 && std::strcmp(argv[1], "--fault-bench") == 0) {
+    VulkanHarness vulkan;
+    vulkan.BenchFaults(argc >= 3 ? static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10))
+                                 : 1024u);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
