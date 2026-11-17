@@ -18,6 +18,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +51,9 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Counts the shaders mapped so far. An entry a thread looked up stays current while this does
+// not change, since entries are only added or replaced.
+static std::atomic<uint64_t> g_shader_map_generation {1};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -87,14 +92,31 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
+	// Every draw looks up the shaders of its stages, mostly those of the draw before it. The
+	// thread keeps its last lookups so that these take neither the lock nor a hash lookup.
+	struct Cached {
+		uint64_t       addr       = 0;
+		uint64_t       generation = 0;
+		ShaderMapEntry entry {};
+	};
+	static thread_local std::array<Cached, 8> cache;
+	auto&      cached     = cache[((addr >> 4u) ^ (addr >> 16u)) % cache.size()];
+	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
+	if (cached.addr == addr && cached.generation == generation) {
+		return cached.entry;
+	}
+
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		// The generation cannot change while the lock is held.
+		cached = {addr, g_shader_map_generation.load(std::memory_order_relaxed), iter->second};
 		return iter->second;
 	}
 
