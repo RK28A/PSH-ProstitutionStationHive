@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -336,6 +337,8 @@ struct PthreadMutexPrivate {
 		std::condition_variable cv;
 		Waiter*                 previous = nullptr;
 		Waiter*                 next     = nullptr;
+		// Set, with the mutex's lock held, once the mutex belongs to this waiter.
+		std::atomic<bool> granted {false};
 	};
 	uint8_t                 reserved[256];
 	std::string             name;
@@ -346,6 +349,9 @@ struct PthreadMutexPrivate {
 	int                     pprotocol = PTHREAD_PRIO_NONE;
 	Waiter*                 first_waiter = nullptr;
 	Waiter*                 last_waiter  = nullptr;
+	// Consecutive waits that outlasted their spin, and the waits that then went without one.
+	uint8_t spin_misses = 0;
+	uint8_t spin_skips  = 0;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1250,6 +1256,41 @@ static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
 	}
 }
 
+// A queued thread watches for its turn this long before it sleeps: a short critical section ends
+// well before a sleeping thread could be woken, and every unlock of a contended mutex would
+// otherwise wait for one.
+constexpr auto MUTEX_SPIN_TIME = std::chrono::microseconds(50);
+// A mutex whose waits keep outlasting the spin is held for longer than spinning can cover; its
+// waiters then sleep at once, apart from one in MUTEX_SPIN_RETRY_INTERVAL that tries again.
+constexpr uint8_t MUTEX_SPIN_MISS_LIMIT     = 4;
+constexpr uint8_t MUTEX_SPIN_RETRY_INTERVAL = 16;
+
+static bool NativeMutexShouldSpin(PthreadMutexPrivate* mutex) {
+	if (mutex->spin_misses < MUTEX_SPIN_MISS_LIMIT) {
+		return true;
+	}
+	if (++mutex->spin_skips < MUTEX_SPIN_RETRY_INTERVAL) {
+		return false;
+	}
+	mutex->spin_skips = 0;
+	return true;
+}
+
+static bool NativeMutexSpin(const PthreadMutexPrivate::Waiter&    waiter,
+                            std::chrono::steady_clock::time_point limit) {
+	for (;;) {
+		for (int i = 0; i < 32; i++) {
+			if (waiter.granted.load(std::memory_order_acquire)) {
+				return true;
+			}
+			_mm_pause();
+		}
+		if (std::chrono::steady_clock::now() >= limit) {
+			return false;
+		}
+	}
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1294,6 +1335,15 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	                          ? std::chrono::steady_clock::now() +
 	                                std::chrono::microseconds(*timeout_us)
 	                          : std::chrono::steady_clock::time_point::max();
+	if (NativeMutexShouldSpin(mutex)) {
+		// The queue position is taken; only the wait for it differs.
+		lock.unlock();
+		const bool granted = NativeMutexSpin(
+		    waiter, std::min(deadline, std::chrono::steady_clock::now() + MUTEX_SPIN_TIME));
+		lock.lock();
+		mutex->spin_misses =
+		    granted ? 0 : std::min<uint8_t>(mutex->spin_misses + 1, MUTEX_SPIN_MISS_LIMIT);
+	}
 	int result = OK;
 	while (mutex->owner != self) {
 		const auto now = std::chrono::steady_clock::now();
@@ -1370,6 +1420,7 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 		// Transfer ownership in FIFO order before waking the selected waiter.
 		mutex->owner = waiter->thread;
 		mutex->count = 1;
+		waiter->granted.store(true, std::memory_order_release);
 		waiter->cv.notify_one();
 	} else {
 		mutex->owner = nullptr;
