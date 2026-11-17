@@ -22162,6 +22162,184 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Times steady-state draws through the render executor and prints the CPU time per draw:
+  //   shader_recompiler_compute_tests --draw-bench [draws]
+  // Every scenario draws one triangle into a 32x32 target, so the time is the renderer's own
+  // per-draw work and not the rasterizer's.
+  void BenchDraws(uint32_t draws) {
+    const char *name = "DrawBench";
+    constexpr uint32_t extent = 32;
+    constexpr uintptr_t base_address = 0x0000000204400000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
+    scheduler.Begin(registers, user_config, shaders);
+    auto &executor = context.GetRenderExecutor();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base_address);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base_address),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    context.MapMemory(base_address, allocation_size);
+
+    static const auto vertex_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 1, 0xbf800000u);
+      AppendVMovLiteral(&code, 2, 0x40400000u);
+      code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+      code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+      code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+      code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, 0x3f800000u);
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(3, 4, 0, 6));
+      for (u32 parameter = 0; parameter < 8; parameter++) {
+        code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+        code.push_back(EncodeExp1(0, 0, 0, 0));
+      }
+      AppendEnd(&code);
+      return code;
+    }();
+    static const auto pixel_codes = [] {
+      std::array<std::vector<u32>, 2> result;
+      for (u32 variant = 0; variant < result.size(); variant++) {
+        auto &code = result[variant];
+        AppendVMovU32(&code, 0, 0);
+        AppendSMovLiteral(&code, 107, variant == 0 ? 0x3e800000u : 0x3f000000u);
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 0));
+        code.push_back(EncodeVop1(0x01, 1, 107));
+        AppendVMovLiteral(&code, 2, 0x3f800000u);
+        code.push_back(EncodeExp0(0x00, 0xf));
+        code.push_back(EncodeExp1(1, 1, 1, 2));
+        AppendEnd(&code);
+      }
+      return result;
+    }();
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
+    ShaderMapUserData(vertex_address,
+        {.type = Prospero::ShaderBinaryType::kGs,
+         .user_data = &vertex_user_data,
+         .code_size_bytes = static_cast<uint32_t>(vertex_code.size() * sizeof(u32))});
+    std::array<uint64_t, 2> pixel_addresses{};
+    for (size_t variant = 0; variant < pixel_codes.size(); variant++) {
+      pixel_addresses[variant] = reinterpret_cast<uint64_t>(pixel_codes[variant].data());
+      ShaderMapUserData(pixel_addresses[variant],
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes =
+               static_cast<uint32_t>(pixel_codes[variant].size() * sizeof(u32))});
+    }
+    shaders.SetEsShaderBase(vertex_address);
+    shaders.SetPsShaderBase(pixel_addresses[0]);
+
+    registers.SetViewportTransformControl(0x300);
+    registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+    registers.SetViewportZMax(0, 1);
+    registers.SetScreenScissor(0, 0, extent, extent);
+    registers.SetWindowScissor(0, 0, extent, extent, false);
+    registers.SetGenericScissor(0, 0, extent, extent, false);
+    for (const auto slot : {0u, 1u}) {
+      registers.SetColorBase(slot, {.addr = base_address + 0x10000 + slot * 0x10000});
+      registers.SetColorInfo(slot,
+          {.format = Prospero::ChannelLayout::k32_32_32_32,
+           .channel_type = Prospero::ChannelType::kFloat,
+           .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(slot, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(slot,
+          {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    }
+    registers.SetTargetOutputMode(0, 4);
+    registers.SetPsInControl(0x8008);
+    user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+
+    const DrawAutoArgs args{.vertex_count = 3, .instance_count = 1};
+    enum class Churn { None, PixelShader, BlendConstant, Viewport, RenderTarget };
+    const auto prepare = [&](Churn churn, uint32_t draw) {
+      switch (churn) {
+        case Churn::None: break;
+        case Churn::PixelShader: shaders.SetPsShaderBase(pixel_addresses[draw & 1u]); break;
+        case Churn::BlendConstant:
+          registers.SetBlendColor({.red = static_cast<float>(draw & 1u), .alpha = 1.0f});
+          break;
+        case Churn::Viewport:
+          registers.SetViewportZMax(0, (draw & 1u) != 0 ? 1.0f : 0.5f);
+          break;
+        case Churn::RenderTarget:
+          // Two targets of the same format, bound alternately as target 0.
+          registers.SetColorBase(0, {.addr = base_address + 0x10000 + (draw & 1u) * 0x10000});
+          break;
+      }
+    };
+    const auto run = [&](const char *label, Churn churn) {
+      // Warm the program, pipeline and image caches for both states.
+      for (uint32_t draw = 0; draw < 4; draw++) {
+        prepare(churn, draw);
+        Require(name, label,
+                RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(), args),
+                "the draw was not emitted");
+      }
+      scheduler.Finish();
+      // The calling thread's CPU time, which a busy rasterizer thread does not disturb; hosts
+      // without a thread clock fall back to elapsed time.
+      const auto thread_time = []() -> std::chrono::nanoseconds {
+#if defined(_WIN32)
+        return std::chrono::steady_clock::now().time_since_epoch();
+#else
+        timespec time{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
+        return std::chrono::seconds(time.tv_sec) + std::chrono::nanoseconds(time.tv_nsec);
+#endif
+      };
+      const auto begin = std::chrono::steady_clock::now();
+      const auto cpu_begin = thread_time();
+      for (uint32_t draw = 0; draw < draws; draw++) {
+        prepare(churn, draw);
+        RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(), args);
+        if ((draw + 1) % 1024 == 0) {
+          scheduler.Flush();
+        }
+      }
+      const auto cpu = thread_time() - cpu_begin;
+      scheduler.Finish();
+      const auto finished = std::chrono::steady_clock::now();
+      const auto per_draw = [draws](auto duration) {
+        return std::chrono::duration<double, std::nano>(duration).count() / draws;
+      };
+      std::printf("[bench]   %-24s %9.1f ns/draw on the recording thread, %9.1f ns/draw with "
+                  "GPU completion\n",
+                  label, per_draw(cpu), per_draw(finished - begin));
+    };
+    run("same state", Churn::None);
+    run("alternating pixel shader", Churn::PixelShader);
+    run("alternating blend color", Churn::BlendConstant);
+    run("alternating viewport", Churn::Viewport);
+    run("alternating target", Churn::RenderTarget);
+
+    context.UnmapMemory(base_address, allocation_size);
+    scheduler.Finish();
+    Require(name, "release memory",
+            Libs::LibKernel::Memory::KernelMunmap(base_address, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "mapping or allocation release failed");
+  }
+
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const bool object_id = !test.object_ids.empty();
@@ -56377,6 +56555,12 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc >= 2 && std::strcmp(argv[1], "--draw-bench") == 0) {
+    VulkanHarness vulkan;
+    vulkan.BenchDraws(argc >= 3 ? static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10))
+                                : 20000u);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));
