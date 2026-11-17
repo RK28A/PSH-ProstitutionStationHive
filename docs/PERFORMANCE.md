@@ -49,7 +49,7 @@ compare le résultat à `tests/software_gpu_layer/expected_failures.txt`. Avec M
 de minLod de vue, une erreur LLVM sur un geometry shader) et sont listés pour qu'un changement du
 moteur de rendu se voie comme un écart à cette liste. Il faut `xvfb` et `mesa-vulkan-drivers`.
 
-Deux bancs de mesure :
+Trois bancs de mesure :
 
 ```bash
 shader_recompiler_compute_tests --draw-bench 100000
@@ -66,20 +66,45 @@ kernel_file_system_tests --mutex-bench 500
 donne le débit d'un mutex du jeu partagé par 1, 2, 4 et 8 threads, et vérifie l'exclusion
 mutuelle.
 
+```bash
+shader_recompiler_compute_tests --fault-bench 4096
+```
+
+donne le nombre de fautes et le temps pris pour écrire des pages suivies par le cache de buffers.
+
 Ordres de grandeur relevés sur lavapipe : environ 1 µs de processeur par draw sans texture, 3 µs
 avec une texture. Dans ce temps, la résolution des shaders à chaque draw
 (`PipelineCache::GetGraphicsPrograms`) pèse environ 30 %, celle des cibles de rendu 10 %, la
 recherche du pipeline 7 %.
 
-## Branche expérimentale
+## Branches expérimentales
 
-`experimental/mutex-barging` change **quel** thread obtient un mutex disputé : un mutex libéré
+Deux changements touchent des mécanismes trop sensibles pour aller sur `main` sans avoir été
+essayés sur des jeux. Chacun a sa branche, construite par la CI comme `main` ; les deux passent les
+mêmes tests que `main`.
+
+**`experimental/fault-ahead`** s'attaque au coût des fautes de page du suivi mémoire GPU. Chaque
+page de 4 Ko qu'un jeu écrit dans une zone suivie coûte une faute d'environ 3 µs sous Linux,
+presque entièrement dans le noyau. Quand les fautes d'un thread se suivent page après page, la
+branche libère aussi les pages suivantes, deux fois plus à chaque fois, jusqu'à 64. Mesuré avec
+`shader_recompiler_compute_tests --fault-bench` :
+
+| Pages écrites dans l'ordre | `main` | `experimental/fault-ahead` |
+| --- | --- | --- |
+| 256 (1 Mo) | 256 fautes, 1,03 ms | 10 fautes, 0,064 ms |
+| 4096 (16 Mo) | 4096 fautes, 10,7 ms | 70 fautes, 0,69 ms |
+| 16384 (64 Mo) | 16384 fautes, 43,3 ms | 262 fautes, 2,19 ms |
+
+Le risque : une page libérée que le jeu n'écrit finalement pas est renvoyée au GPU à l'identique,
+ce qui coûte un envoi inutile, et le chemin modifié est au cœur de la synchronisation entre le
+processeur et le GPU.
+
+**`experimental/mutex-barging`** change **quel** thread obtient un mutex disputé : un mutex libéré
 revient au premier thread qui le demande, comme sur la console, au lieu d'être réservé au premier
 de la file ; un thread dépassé depuis 1 ms le reçoit quand même directement. Avec plus de threads
 que de cœurs, le débit passe de 71 000 à environ 2 millions de verrouillages/s. À quatre threads
 sur quatre cœurs, le résultat n'est pas meilleur que `main`. L'amont a choisi l'ordre FIFO strict
-en octobre 2026 ; ce changement peut donc casser un jeu qui en dépend, et il reste hors de `main`
-tant qu'il n'a pas été essayé sur des jeux.
+en octobre 2026 ; ce changement peut donc casser un jeu qui en dépend.
 
 ## Obtenir un build
 
@@ -92,19 +117,15 @@ utilisent l'optimisation à l'édition de liens. Pour un build local équivalent
 
 Classées par gain attendu. Aucune n'est faite.
 
-1. **Fautes de page du suivi mémoire GPU.** Chaque page de 4 Ko écrite par le jeu dans une zone
-   suivie coûte un signal et un `mprotect` (`RenderContext::HandleFault` invalide un octet).
-   Lever la protection des pages voisines lors d'écritures séquentielles réduirait le nombre de
-   fautes, au prix d'une logique délicate pour les pages modifiées par le GPU.
-2. **Résolution des shaders par draw.** `GetGraphicsPrograms` reconstruit la clé de chaque étage
+1. **Résolution des shaders par draw.** `GetGraphicsPrograms` reconstruit la clé de chaque étage
    et reparcourt les tables de ressources à chaque draw. Un cache du dernier résultat demande une
    clé d'invalidation exacte, y compris la mémoire du jeu que le parcours lit.
-3. **Chemin rapide des mutex sans verrou interne.** Verrouiller puis déverrouiller un mutex libre
+2. **Chemin rapide des mutex sans verrou interne.** Verrouiller puis déverrouiller un mutex libre
    prend 37 ns et passe deux fois par un `std::mutex` ; un mot atomique diviserait ce coût.
-4. **Sommeils courts sous Windows.** Les timers haute résolution y ont un grain d'environ 0,5 ms,
+3. **Sommeils courts sous Windows.** Les timers haute résolution y ont un grain d'environ 0,5 ms,
    donc un `usleep(100)` du jeu dure plusieurs fois trop longtemps. Le corriger demande une
    attente active dont le coût processeur ne peut se régler que sur des jeux.
-5. **Ne pas réémettre des descripteurs identiques.** Étudié et écarté : les constantes par objet
+4. **Ne pas réémettre des descripteurs identiques.** Étudié et écarté : les constantes par objet
    changent à chaque draw, le cas ne se présenterait presque jamais.
 
 ## La liste de 500 points
@@ -116,7 +137,7 @@ Ce n'est pas une vérification point par point.
 | --- | --- | --- |
 | 1–20 | Shaders et pipelines | Présents : cache de pipelines sur disque, préchauffage au démarrage réparti sur les cœurs, déduplication par empreinte du code, IR avec passes, extraction des shaders. Absents : compilation asynchrone, ubershader de repli, `graphics_pipeline_library`, `shader_object` |
 | 21–40 | Rendu et backend | Présents : thread GPU dédié, rendu dynamique, tas d'images bindless, états dynamiques non réémis, détuilage GPU, FSR/DLSS, HDR10, timeline semaphores, validation et RenderDoc. Absents : enregistrement parallèle des command buffers, backends Metal ou DX12 natifs |
-| 41–60 | Mémoire | Présent : suivi des écritures par protection de pages. Absents : huge pages, `userfaultfd`/`GetWriteWatch`, import par `external_memory_host` |
+| 41–60 | Mémoire | Présent : suivi des écritures par protection de pages. **Branche expérimentale : regroupement des fautes d'écriture (44, 45).** Absents : huge pages, `userfaultfd`/`GetWriteWatch`, import par `external_memory_host` |
 | 61–80 | CPU et threads | Présents : un thread hôte par thread du jeu, patch unique des instructions spéciales, émulation des instructions absentes, Rosetta 2. **Faits ici : attente avant sommeil des mutex (78), timers précis sous Linux (67).** Absents : priorités de threads, placement sur les cœurs performants |
 | 81–100 | HLE système | Présents : trophées, plusieurs utilisateurs, clavier virtuel, dialogues, décodeur AJM. Non examinés en détail |
 | 101–120 | Performance et profilage | Présents : Tracy, overlay, LTO en CI, mode mailbox. **Faits ici : bancs de mesure reproductibles (115), un appel pilote en moins par draw.** Absent : PGO |
